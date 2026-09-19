@@ -1,147 +1,125 @@
 ---
 name: launch-codex-remote-worker
-description: Launch, recover, pair, or open projects on a singleton Codex Remote Control worker in a Slurm compute allocation. Use for a persistent launcher/replaceable worker design; not for the master login-node Codex or ordinary batch jobs.
+description: Set up, pair, and manage a persistent Codex Remote Control server on a Linux devbox using a systemd user service. Use for startup after reboot, recovery after a server exit, and remote access to projects.
 ---
 
-# Launch Codex remote worker
+# Launch Codex on a Linux devbox
 
-Use this architecture:
+Run one Codex daemon for the user's persistent Codex home. The bundled systemd
+user service starts it at boot, checks it periodically, and stops it cleanly.
+The server is independent of any project or worktree.
 
-```text
-master Codex on login node -> Slurm allocation -> compute node -> worker Codex
-```
+## Inspect the devbox
 
-The master is a lightweight persistent launcher using `~/.codex`. The worker
-does project work on a compute node using persistent state in
-`~/.codex-worker`. The worker is a singleton, but its Slurm process and physical
-node are replaceable.
+- Check the installed Codex version, `codex app-server daemon --help`, and
+  `codex remote-control --help`. The commands below were checked with 0.154.0.
+- Confirm `systemctl --user` works. This skill requires systemd user services;
+  a detached process alone does not establish startup after reboot.
+- Identify the current Codex home, binary, and any existing service before
+  installing another supervisor. Reuse an existing service for that home.
+- The examples use `~/.codex` and `~/.local/bin/codex`. If the user already uses
+  a different home or binary, use those paths consistently in the service,
+  login, pairing, and verification commands.
 
-## Preserve these invariants
+## Installation and login
 
-- Keep the worker project-independent; do not create or bind a worktree during
-  launch.
-- Never start or stop the worker with the master `CODEX_HOME`.
-- Run only one app-server against `~/.codex-worker` at a time.
-- Reuse `~/.codex-worker` so worker threads, pairing identity, and history
-  survive allocation changes.
-- Share selected user setup only. Keep worker databases, sessions, memories,
-  installation identity, locks, sockets, logs, and caches separate from the
-  master.
-- Both agents see the same project filesystem. Coordinate edits rather than
-  letting master and worker modify the same files concurrently.
-
-## One-time worker home
-
-Create `~/.codex-worker` with mode `700`. Symlink these paths to the master:
-
-```text
-~/.codex-worker/auth.json   -> ~/.codex/auth.json
-~/.codex-worker/config.toml -> ~/.codex/config.toml
-~/.codex-worker/AGENTS.md   -> ~/.codex/AGENTS.md
-~/.codex-worker/skills      -> ~/.codex/skills
-```
-
-If a worker-local `skills/` directory already exists, move it aside before
-creating the link. Do not symlink the entire `~/.codex` directory.
-
-Daemon mode also needs the managed standalone binary at:
-
-```text
-~/.codex-worker/packages/standalone/current/codex
-```
-
-Link `current` to the resolved master standalone release under
-`~/.codex/packages/standalone/releases/`. The worker updater may later replace
-that link with a newer worker-local release.
-
-## Inspect before launch
-
-Record the login-node hostname and inspect `tmux` plus `squeue`. Reuse a live
-worker and never create a duplicate. Choose resources from current partition
-limits and actual work. `devel` is for a short one-off session, not a recurring
-service; use `day` or `week` when the intended walltime requires them.
-
-For an unattended allocation, submit the included update-safe helper. Example:
+Use a complete standalone Codex installation. If Codex is missing or its
+managed daemon package is unavailable, use the official installer:
 
 ```bash
-worker_script="$HOME/.codex/skills/launch-codex-remote-worker/scripts/codex-worker.sbatch"
-sbatch \
-  --job-name=codex-worker \
-  --partition=devel \
-  --time=06:00:00 \
-  --nodes=1 \
-  --ntasks=1 \
-  --cpus-per-task=4 \
-  --mem=16G \
-  --output="$HOME/.codex-worker/slurm-%j.out" \
-  --error="$HOME/.codex-worker/slurm-%j.err" \
-  "$worker_script"
+curl -fsSL https://chatgpt.com/codex/install.sh | sh
 ```
 
-The helper keeps the allocation alive across normal app-server PID rotation
-during Codex updates. It rereads the PID file and restarts Remote Control only
-when no replacement daemon appears after a grace period. It does not renew an
-expired Slurm allocation automatically.
-
-To replace a running worker without sharing state concurrently, pass its job ID
-as the helper's sole argument. The new allocation stops and cancels that old job
-before starting its daemon:
+Run as the devbox user, not root. Check authentication in the selected home:
 
 ```bash
-sbatch [resource options] "$worker_script" OLD_JOB_ID
+CODEX_HOME="$HOME/.codex" "$HOME/.local/bin/codex" login status
 ```
 
-## Interactive mode
-
-For interactive development, use `$tmux-salloc` with a project-independent
-session named `codex-worker`, starting in `$HOME`. Once inside the compute shell:
+If needed, start the headless ChatGPT login flow and let the user complete it:
 
 ```bash
-export CODEX_HOME="$HOME/.codex-worker"
-export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
-export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
-export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
-"$HOME/.local/bin/codex" remote-control start
+CODEX_HOME="$HOME/.codex" "$HOME/.local/bin/codex" login --device-auth
 ```
 
-Use daemon subcommand `start`, not bare foreground `codex remote-control`, so
-the control socket required by `pair` exists.
+Account login and remote pairing are separate steps. Preserve the selected
+Codex home across restarts so authentication, pairing identity, and threads
+survive. Do not copy another machine's databases or installation identity.
 
-## Pairing and node changes
+## Install the persistent service
 
-Generate a code only when the current app is not already connected:
+Use the bundled [supervisor](scripts/codex-worker.sh) and
+[user service](assets/codex-worker.service). From this skill's directory:
 
 ```bash
-CODEX_HOME="$HOME/.codex-worker" \
-  "$HOME/.local/bin/codex" remote-control pair
+install -Dm755 scripts/codex-worker.sh "$HOME/.local/libexec/codex-worker.sh"
+install -Dm644 assets/codex-worker.service \
+  "$HOME/.config/systemd/user/codex-worker.service"
 ```
 
-The app may retain the hostname label from the first paired compute node after
-Slurm moves the worker. If that entry stays connected and shows worker threads,
-treat it as the stable logical worker. Use `squeue` to identify the physical
-node.
+Before starting, adjust `CODEX_HOME` and `CODEX_BIN` in the installed unit if
+they differ from the defaults. Include any environment variables needed by the
+user's tools; a systemd service does not read the interactive shell's startup
+files. Preserve unrelated existing configuration.
 
-## Open a project
+For startup without an interactive login and survival after logout, enable
+lingering for this user:
 
-The worker is not tied to a repository. Open any project from the remote app,
-or seed a thread from the compute shell:
+```bash
+loginctl enable-linger "$USER"
+loginctl show-user "$USER" -p Linger
+systemctl --user daemon-reload
+systemctl --user enable --now codex-worker.service
+```
+
+If enabling linger needs administrator privileges, report that specific
+requirement; do not claim reboot persistence until it is enabled.
+
+The supervisor calls `app-server daemon bootstrap --remote-control` at startup,
+then the idempotent `app-server daemon start` every minute. Codex manages its
+own daemon identity and serializes lifecycle changes, including updates. No
+PID-file parsing or separate foreground app-server is needed. Manage this
+instance through systemd so a manual stop is not undone by the next check.
+
+## Pair and open a project
+
+Once the service is healthy, generate a code if the app is not already paired:
+
+```bash
+CODEX_HOME="$HOME/.codex" "$HOME/.local/bin/codex" remote-control pair
+```
+
+Give the short-lived code to the user to enter in the app. Keep it out of
+committed files and persistent setup notes. Confirm the app connects to this
+devbox, then open any project folder through the remote app.
+
+For a local terminal session using the same state:
 
 ```bash
 cd /absolute/path/to/project
-"$HOME/.local/bin/codex"
+CODEX_HOME="$HOME/.codex" "$HOME/.local/bin/codex"
 ```
 
-Do not use `exec` for a project TUI if returning from Codex should return to the
-compute shell. A new empty TUI may not appear remotely until its first message.
-
-## Stop only the worker
-
-Stop Remote Control with worker state, then release only its allocation:
+## Verify and manage
 
 ```bash
-CODEX_HOME="$HOME/.codex-worker" \
-  "$HOME/.local/bin/codex" remote-control stop
+systemctl --user is-enabled codex-worker.service
+systemctl --user status codex-worker.service --no-pager
+journalctl --user -u codex-worker.service -n 50 --no-pager
+CODEX_HOME="$HOME/.codex" "$HOME/.local/bin/codex" app-server daemon version
 ```
 
-Preserve `~/.codex-worker` for the next allocation. Never cancel a different
-service merely because it runs on a node that previously hosted the worker.
+An active supervisor alone does not prove remote connectivity. Confirm the
+daemon responds and a project or saved thread opens from the paired app.
+Reconnect after closing the setup SSH session and check it again. Report boot
+configuration separately from an actual reboot test; reboot only when asked.
+
+```bash
+systemctl --user restart codex-worker.service
+systemctl --user stop codex-worker.service
+# To also prevent startup on future boots:
+systemctl --user disable --now codex-worker.service
+```
+
+Restarting interrupts active work. Preserve the Codex home when stopping or
+disabling the service; the next start should retain pairing and threads.

@@ -1,0 +1,16 @@
+[Unit]
+Description=Codex Remote Control server
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+Environment="CODEX_HOME=%h/.codex"
+Environment="CODEX_BIN=%h/.local/bin/codex"
+ExecStart=%h/.local/libexec/codex-worker.sh
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=90
+KillMode=mixed
+
+[Install]
+WantedBy=default.target
